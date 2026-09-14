@@ -1,0 +1,47 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
+
+# ---- Node ----
+node_modules/
+dist/
+.npm/
+*.log
+
+# ---- C / C++ ----
+build/
+cmake-build-*/
+*.o
+*.obj
+*.pdb
+*.ilk
+*.exp
+
+# ---- Unity ----
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+
+# ---- Editors / OS ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- Secrets ----
+.env
+.env.*
+*.key
+*.pem
+*.pfx
+*.p12
+id_rsa*
