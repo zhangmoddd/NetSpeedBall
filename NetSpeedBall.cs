@@ -25,17 +25,25 @@ namespace NetSpeedBall
             {
                 if (!createdNew)
                 {
+                    // 已经有一个实例在跑了：让那个把悬浮球亮出来，别让用户以为双击没反应。
+                    uint message = NativeMethods.RegisterWindowMessage("NetSpeedBall.ShowBall");
+                    if (message != 0)
+                    {
+                        NativeMethods.PostMessage(new IntPtr(NativeMethods.HwndBroadcast), message,
+                            IntPtr.Zero, IntPtr.Zero);
+                    }
+
                     return;
                 }
 
                 Application.EnableVisualStyles();
-            Application.SetCompatibleTextRenderingDefault(false);
-            if (args != null && args.Length >= 2 &&
-                string.Equals(args[0], "--render-preview", StringComparison.OrdinalIgnoreCase))
-            {
-                SpeedBallForm.SavePreview(args[1]);
-                return;
-            }
+                Application.SetCompatibleTextRenderingDefault(false);
+                if (args != null && args.Length >= 2 &&
+                    string.Equals(args[0], "--render-preview", StringComparison.OrdinalIgnoreCase))
+                {
+                    SpeedBallForm.SavePreview(args[1]);
+                    return;
+                }
 
                 Application.Run(new SpeedBallApplication());
             }
@@ -109,6 +117,12 @@ namespace NetSpeedBall
             menu.Items.Add(new ToolStripMenuItem("\u6d41\u91cf\u7edf\u8ba1", null, OnShowTrafficWindow));
             menu.Items.Add(new ToolStripMenuItem("\u6253\u5f00\u4efb\u52a1\u7ba1\u7406\u5668", null, OnOpenTaskManager));
             menu.Items.Add(new ToolStripMenuItem("\u91cd\u7f6e\u4eca\u65e5\u6d41\u91cf", null, OnResetTraffic));
+            if (!AppTrafficMonitor.CanCollectAppTraffic)
+            {
+                // 逐连接的字节统计只对管理员开放，普通权限下这里给一条现成的通路。
+                menu.Items.Add(new ToolStripMenuItem("\u4ee5\u7ba1\u7406\u5458\u8eab\u4efd\u91cd\u542f", null, OnRestartElevated));
+            }
+
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(new ToolStripMenuItem("\u9000\u51fa", null, OnExit));
 
@@ -356,6 +370,27 @@ namespace NetSpeedBall
             trayIcon.ShowBalloonTip(2000);
         }
 
+        private void OnRestartElevated(object sender, EventArgs e)
+        {
+            try
+            {
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = Application.ExecutablePath,
+                    UseShellExecute = true,
+                    Verb = "runas"
+                });
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("\u63d0\u6743\u5931\u8d25\uff1a\r\n" + ex.Message, "\u7f51\u7edc\u6d4b\u901f\u7403",
+                    MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            ExitThread();
+        }
+
         private void OnExit(object sender, EventArgs e)
         {
             ExitThread();
@@ -410,6 +445,9 @@ namespace NetSpeedBall
     internal sealed class SpeedBallForm : Form
     {
         private const int BallSize = 122;
+        // 第二个实例启动时会广播这条消息，界面上收到就把悬浮球叫出来。
+        private static readonly int ShowBallMessageId =
+            (int)NativeMethods.RegisterWindowMessage("NetSpeedBall.ShowBall");
         private SpeedSample currentSample;
         private bool useMegabits;
         private Point dragStart;
@@ -873,6 +911,18 @@ namespace NetSpeedBall
         {
             base.OnDoubleClick(e);
             BringToFront();
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            if (m.Msg != 0 && m.Msg == ShowBallMessageId)
+            {
+                Show();
+                EnsureVisible();
+                BringToFront();
+            }
+
+            base.WndProc(ref m);
         }
 
         protected override void OnSizeChanged(EventArgs e)
@@ -2413,7 +2463,16 @@ namespace NetSpeedBall
             {
                 using (Brush empty = new SolidBrush(Color.FromArgb(150, 120, 134, 154)))
                 {
-                    g.DrawString("所选范围内暂无应用流量记录", smallFont, empty, 16, y + 6);
+                    // 空列表有两种原因，必须说清楚，否则用户只会以为功能坏了。
+                    if (AppTrafficMonitor.CanCollectAppTraffic)
+                    {
+                        g.DrawString("所选范围内暂无应用流量记录", smallFont, empty, 16, y + 6);
+                    }
+                    else
+                    {
+                        g.DrawString("应用流量排行需要管理员权限", smallFont, empty, 16, y + 6);
+                        g.DrawString("右键托盘图标 → 以管理员身份重启", smallFont, empty, 16, y + 24);
+                    }
                 }
             }
         }
@@ -3393,24 +3452,96 @@ namespace NetSpeedBall
     // mechanism Resource Monitor uses; no admin rights required).
     internal sealed class AppTrafficMonitor
     {
+        // 连接记录只在闲置超时后清理：如果每轮都重建，某轮没读到某条连接就会被
+        // 当成"新连接"重新整笔计入，流量会翻倍。
+        private static readonly TimeSpan FlowIdleTimeout = TimeSpan.FromMinutes(5);
+        private static readonly TimeSpan NameCacheLifetime = TimeSpan.FromSeconds(60);
+
         private readonly TrafficStore store;
-        private readonly Dictionary<TcpFlowKey, long[]> flows = new Dictionary<TcpFlowKey, long[]>();
-        private readonly Dictionary<int, string> processNames = new Dictionary<int, string>();
+        private readonly Dictionary<TcpFlowKey, FlowState> flows = new Dictionary<TcpFlowKey, FlowState>();
+        private readonly Dictionary<int, ProcessNameEntry> processNames = new Dictionary<int, ProcessNameEntry>();
         private byte[] v4Buffer = new byte[0];
         private byte[] v6Buffer = new byte[0];
         private IntPtr statsBuffer;
+        private IntPtr enableBuffer;
+        private int ticksSincePrune;
+
+        private sealed class FlowState
+        {
+            public long InBytes;
+            public long OutBytes;
+            public DateTime LastSeenUtc;
+            public bool Enabled;
+            public bool HasBaseline;
+        }
+
+        private sealed class ProcessNameEntry
+        {
+            public string Name;
+            public DateTime ExpiresUtc;
+        }
 
         public AppTrafficMonitor(TrafficStore trafficStore)
         {
             store = trafficStore;
             statsBuffer = Marshal.AllocHGlobal(NativeMethods.TcpEstatsDataSize);
+            enableBuffer = Marshal.AllocHGlobal(NativeMethods.TcpEstatsDataRwSize);
+            Marshal.WriteByte(enableBuffer, 1); // EnableCollection = TRUE
+        }
+
+        // 每条连接的字节统计默认关闭，必须先向系统申请启用，而该申请只对管理员放行。
+        // 界面用它来决定是显示排行榜还是显示"需要管理员权限"的说明。
+        public static bool CanCollectAppTraffic
+        {
+            get { return NativeMethods.IsUserAnAdmin(); }
         }
 
         public void Sample()
         {
             SampleFamily(NativeMethods.AddressFamilyInet);
             SampleFamily(NativeMethods.AddressFamilyInet6);
+
+            if (++ticksSincePrune >= 60)
+            {
+                ticksSincePrune = 0;
+                PruneFlows();
+            }
+
             store.CheckDayRoll();
+        }
+
+        // 连接结束后它的记录会一直留着，这里定期回收，防止长跑之后字典无限膨胀。
+        private void PruneFlows()
+        {
+            DateTime flowDeadline = DateTime.UtcNow - FlowIdleTimeout;
+            List<TcpFlowKey> staleFlows = new List<TcpFlowKey>();
+            foreach (KeyValuePair<TcpFlowKey, FlowState> pair in flows)
+            {
+                if (pair.Value.LastSeenUtc < flowDeadline)
+                {
+                    staleFlows.Add(pair.Key);
+                }
+            }
+
+            for (int i = 0; i < staleFlows.Count; i++)
+            {
+                flows.Remove(staleFlows[i]);
+            }
+
+            DateTime nameDeadline = DateTime.UtcNow;
+            List<int> staleNames = new List<int>();
+            foreach (KeyValuePair<int, ProcessNameEntry> pair in processNames)
+            {
+                if (pair.Value.ExpiresUtc <= nameDeadline)
+                {
+                    staleNames.Add(pair.Key);
+                }
+            }
+
+            for (int i = 0; i < staleNames.Count; i++)
+            {
+                processNames.Remove(staleNames[i]);
+            }
         }
 
         private void SampleFamily(int family)
@@ -3446,7 +3577,10 @@ namespace NetSpeedBall
                 count = maxRows;
             }
 
-            Dictionary<TcpFlowKey, long[]> seen = new Dictionary<TcpFlowKey, long[]>(flows.Count + 16);
+            DateTime now = DateTime.UtcNow;
+            // IPv6 行的每个字段都比 IPv4 行靠后 3 字节；偏移写错会把流量算到别的进程头上。
+            int pidOffset = family == NativeMethods.AddressFamilyInet ? 20 : 52;
+
             GCHandle pinned = GCHandle.Alloc(buffer, GCHandleType.Pinned);
             try
             {
@@ -3457,6 +3591,22 @@ namespace NetSpeedBall
                     TcpFlowKey key = family == NativeMethods.AddressFamilyInet
                         ? ReadV4Key(buffer, offset)
                         : ReadV6Key(buffer, offset);
+
+                    FlowState state;
+                    if (!flows.TryGetValue(key, out state))
+                    {
+                        state = new FlowState();
+                        state.Enabled = TryEnableStats(basePointer, offset, family);
+                        flows.Add(key, state);
+                    }
+
+                    state.LastSeenUtc = now;
+                    if (!state.Enabled)
+                    {
+                        // 申请启用被系统拒绝（普通权限），这条连接读不到字节数。
+                        continue;
+                    }
+
                     IntPtr rowPointer = new IntPtr(basePointer.ToInt64() + offset);
                     uint status = family == NativeMethods.AddressFamilyInet
                         ? NativeMethods.GetPerTcpConnectionEStats(rowPointer, NativeMethods.TcpEstatsTypeData,
@@ -3480,27 +3630,30 @@ namespace NetSpeedBall
                         outBytes = 0;
                     }
 
-                    long[] counters;
-                    if (!flows.TryGetValue(key, out counters))
+                    long deltaIn;
+                    long deltaOut;
+                    if (!state.HasBaseline)
                     {
-                        counters = new long[] { inBytes, outBytes };
-                        seen[key] = counters;
-                        continue;
+                        // 计数器是从连接建立就开始累计的，所以第一次读到的就是这条连接已经
+                        // 发生的全部流量，整笔记下，几秒就结束的短连接才不会被白白丢掉。
+                        deltaIn = inBytes;
+                        deltaOut = outBytes;
+                        state.HasBaseline = true;
+                    }
+                    else
+                    {
+                        deltaIn = inBytes >= state.InBytes ? inBytes - state.InBytes : inBytes;
+                        deltaOut = outBytes >= state.OutBytes ? outBytes - state.OutBytes : outBytes;
                     }
 
-                    seen[key] = counters;
-                    long deltaIn = inBytes >= counters[0] ? inBytes - counters[0] : inBytes;
-                    long deltaOut = outBytes >= counters[1] ? outBytes - counters[1] : outBytes;
-                    counters[0] = inBytes;
-                    counters[1] = outBytes;
+                    state.InBytes = inBytes;
+                    state.OutBytes = outBytes;
                     if (deltaIn <= 0 && deltaOut <= 0)
                     {
                         continue;
                     }
 
-                    int pid = family == NativeMethods.AddressFamilyInet
-                        ? BitConverter.ToInt32(buffer, offset + 20)
-                        : BitConverter.ToInt32(buffer, offset + 49);
+                    int pid = BitConverter.ToInt32(buffer, offset + pidOffset);
                     string app = ResolveName(pid);
                     if (app != null)
                     {
@@ -3512,12 +3665,17 @@ namespace NetSpeedBall
             {
                 pinned.Free();
             }
+        }
 
-            flows.Clear();
-            foreach (KeyValuePair<TcpFlowKey, long[]> pair in seen)
-            {
-                flows.Add(pair.Key, pair.Value);
-            }
+        private bool TryEnableStats(IntPtr basePointer, int offset, int family)
+        {
+            IntPtr rowPointer = new IntPtr(basePointer.ToInt64() + offset);
+            uint status = family == NativeMethods.AddressFamilyInet
+                ? NativeMethods.SetPerTcpConnectionEStats(rowPointer, NativeMethods.TcpEstatsTypeData,
+                    enableBuffer, 0, NativeMethods.TcpEstatsDataRwSize, 0)
+                : NativeMethods.SetPerTcp6ConnectionEStats(rowPointer, NativeMethods.TcpEstatsTypeData,
+                    enableBuffer, 0, NativeMethods.TcpEstatsDataRwSize, 0);
+            return status == 0;
         }
 
         private static TcpFlowKey ReadV4Key(byte[] buffer, int offset)
@@ -3532,15 +3690,18 @@ namespace NetSpeedBall
             return key;
         }
 
+        // MIB_TCP6ROW 各字段相对行首的位置：
+        //   0 State(4) | 4 LocalAddr(16) | 20 LocalScopeId(4) | 24 LocalPort
+        //   | 28 RemoteAddr(16) | 44 RemoteScopeId(4) | 48 RemotePort | 52 OwningPid
         private static TcpFlowKey ReadV6Key(byte[] buffer, int offset)
         {
             TcpFlowKey key = new TcpFlowKey();
-            key.Local1 = (ulong)BitConverter.ToInt64(buffer, offset + 1);
-            key.Local2 = (ulong)BitConverter.ToInt64(buffer, offset + 9);
-            key.Remote1 = (ulong)BitConverter.ToInt64(buffer, offset + 25);
-            key.Remote2 = (ulong)BitConverter.ToInt64(buffer, offset + 33);
-            key.LocalPort = ReadNetworkPort(buffer, offset + 21);
-            key.RemotePort = ReadNetworkPort(buffer, offset + 45);
+            key.Local1 = (ulong)BitConverter.ToInt64(buffer, offset + 4);
+            key.Local2 = (ulong)BitConverter.ToInt64(buffer, offset + 12);
+            key.Remote1 = (ulong)BitConverter.ToInt64(buffer, offset + 28);
+            key.Remote2 = (ulong)BitConverter.ToInt64(buffer, offset + 36);
+            key.LocalPort = ReadNetworkPort(buffer, offset + 24);
+            key.RemotePort = ReadNetworkPort(buffer, offset + 48);
             return key;
         }
 
@@ -3574,12 +3735,13 @@ namespace NetSpeedBall
                 return "系统";
             }
 
-            string name;
-            if (processNames.TryGetValue(pid, out name))
+            ProcessNameEntry entry;
+            if (processNames.TryGetValue(pid, out entry) && entry.ExpiresUtc > DateTime.UtcNow)
             {
-                return name.Length > 0 ? name : null;
+                return entry.Name.Length > 0 ? entry.Name : null;
             }
 
+            string name;
             try
             {
                 using (Process process = Process.GetProcessById(pid))
@@ -3589,18 +3751,29 @@ namespace NetSpeedBall
             }
             catch
             {
-                processNames[pid] = string.Empty; // negative cache: the process is gone
+                // 进程已经不在了。这条缓存只留很短时间，否则进程号被新进程复用后
+                // 排行榜会一直顶着旧程序的名字。
+                CacheName(pid, string.Empty, false);
                 return null;
             }
 
             if (string.IsNullOrEmpty(name))
             {
-                processNames[pid] = string.Empty;
+                CacheName(pid, string.Empty, false);
                 return null;
             }
 
-            processNames[pid] = name;
+            CacheName(pid, name, true);
             return name;
+        }
+
+        private void CacheName(int pid, string name, bool resolved)
+        {
+            ProcessNameEntry entry = new ProcessNameEntry();
+            entry.Name = name;
+            entry.ExpiresUtc = DateTime.UtcNow.Add(
+                resolved ? NameCacheLifetime : TimeSpan.FromSeconds(20));
+            processNames[pid] = entry;
         }
 
         public void Dispose()
@@ -3609,6 +3782,12 @@ namespace NetSpeedBall
             {
                 Marshal.FreeHGlobal(statsBuffer);
                 statsBuffer = IntPtr.Zero;
+            }
+
+            if (enableBuffer != IntPtr.Zero)
+            {
+                Marshal.FreeHGlobal(enableBuffer);
+                enableBuffer = IntPtr.Zero;
             }
         }
     }
@@ -4377,7 +4556,11 @@ namespace NetSpeedBall
         public const int TcpTableOwnerPidAll = 5;
         public const int TcpEstatsTypeData = 1;
         public const int TcpEstatsDataSize = 96;
+        // TCP_ESTATS_DATA_RW_v0 只含一个 EnableCollection 开关，大小正好 1 字节。
+        public const int TcpEstatsDataRwSize = 1;
         public const uint ErrorInsufficientBuffer = 122;
+        public const uint ErrorNotFound = 1168;
+        public const int HwndBroadcast = 0xFFFF;
 
         [StructLayout(LayoutKind.Sequential)]
         public struct FileTime
@@ -4430,6 +4613,25 @@ namespace NetSpeedBall
             IntPtr rw, int rwVersion, int rwSize,
             IntPtr ros, int rosVersion, int rosSize,
             IntPtr rod, int rodVersion, int rodSize);
+
+        // 采集默认是关闭的：只有先用它申请启用，后面的 Get...EStats 才会返回真实字节数。
+        // 这一步需要管理员权限，普通权限会返回 ERROR_ACCESS_DENIED(5)。
+        [DllImport("iphlpapi.dll", SetLastError = true)]
+        public static extern uint SetPerTcpConnectionEStats(IntPtr row, int estatsType,
+            IntPtr rw, int rwVersion, int rwSize, int offset);
+
+        [DllImport("iphlpapi.dll", SetLastError = true)]
+        public static extern uint SetPerTcp6ConnectionEStats(IntPtr row, int estatsType,
+            IntPtr rw, int rwVersion, int rwSize, int offset);
+
+        [DllImport("shell32.dll", SetLastError = true)]
+        public static extern bool IsUserAnAdmin();
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        public static extern uint RegisterWindowMessage(string message);
+
+        [DllImport("user32.dll")]
+        public static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
     }
 }
 
